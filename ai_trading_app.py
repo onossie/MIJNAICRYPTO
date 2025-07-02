@@ -1,15 +1,12 @@
 import streamlit as st
 import pandas as pd
-import time
-from python_bitvavo_api.bitvavo import Bitvavo
-from sklearn.linear_model import LogisticRegression
 import numpy as np
-import os
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from python_bitvavo_api.bitvavo import Bitvavo
 
-# Configuratie
-st.set_page_config(page_title="AI Crypto Bot", layout="wide")
-
-# API Config
+# Load secrets from Streamlit
 API_KEY = st.secrets["BITVAVO_API_KEY"]
 API_SECRET = st.secrets["BITVAVO_API_SECRET"]
 
@@ -17,81 +14,78 @@ bitvavo = Bitvavo({
     'APIKEY': API_KEY,
     'APISECRET': API_SECRET,
     'RESTURL': 'https://api.bitvavo.com/v2',
-    'WSURL': 'wss://ws.bitvavo.com/v2/',
-    'ACCESSWINDOW': 10000,
-    'DEBUGGING': False
+    'WSURL': 'wss://ws.bitvavo.com/v2/'
 })
 
-# Instellingen
-TRADING_PAIR = "ETH-EUR"
-INITIAL_BALANCE = 96.0
-TRAINING_SIZE = 100  # Aantal datapunten om op te trainen
-
-# AI Model
-model = LogisticRegression()
+# Initial values
+START_BALANCE = 100.0
+paper_trading = True
+balance = START_BALANCE
+open_positions = []
 
 @st.cache_data
-def get_historical_prices(pair="ETH-EUR", interval="1h", limit=200):
-    data = bitvavo.candles(pair, interval, {"limit": limit})
-    df = pd.DataFrame(data, columns=[
-        "timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-    df = df.astype(float)
+def get_markets():
+    return bitvavo.markets()
+
+@st.cache_data
+def get_historical_prices():
+    candles = bitvavo.candles("ETH-EUR", "1h", {"limit": 100})
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
     return df
 
-def create_features(df):
-    df["return"] = df["close"].pct_change()
-    df["target"] = (df["return"].shift(-1) > 0).astype(int)
-    df = df.dropna()
-    return df[["return"]], df["target"]
+def train_ai_model(df):
+    df['future_close'] = df['close'].shift(-1)
+    df.dropna(inplace=True)
+    df['target'] = (df['future_close'] > df['close']).astype(int)
 
-# Simuleer paper trading
-def paper_trade(predictions, df, balance):
-    coin = 0
-    for i in range(len(predictions)):
-        if predictions[i] == 1 and balance > 0:
-            coin = balance / df["close"].iloc[i]
-            balance = 0
-        elif predictions[i] == 0 and coin > 0:
-            balance = coin * df["close"].iloc[i]
-            coin = 0
-    return balance + coin * df["close"].iloc[-1]
+    X = df[['open', 'high', 'low', 'close', 'volume']]
+    y = df['target']
 
-# UI
-st.title("🤖 Zelflerende AI Crypto Bot (ETH-EUR)")
-st.write("Start als paper trading. Later kun je echte trading inschakelen.")
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-# Data ophalen
-with st.spinner("⏳ Gegevens laden..."):
-    df = get_historical_prices()
-    X, y = create_features(df)
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-    # Trainen
-    model.fit(X.tail(TRAINING_SIZE), y.tail(TRAINING_SIZE))
+    model = LogisticRegression()
+    model.fit(X_train, y_train)
+    return model, scaler
 
-    # Voorspellen
-    predictions = model.predict(X)
+def make_decision(model, scaler, latest_data):
+    X = latest_data[['open', 'high', 'low', 'close', 'volume']]
+    X_scaled = scaler.transform(X)
+    prediction = model.predict(X_scaled)
+    return prediction[-1]  # 1 = Buy, 0 = Sell
 
-    # Simulatie
-    end_balance = paper_trade(predictions[-TRAINING_SIZE:], df.tail(TRAINING_SIZE), INITIAL_BALANCE)
+def execute_trade(decision, price):
+    global balance, open_positions, paper_trading
 
-    # Laatste prijs
-    current_price = df["close"].iloc[-1]
+    if decision == 1 and balance >= price:
+        st.info(f"BUY @ {price:.2f} EUR")
+        open_positions.append({"entry": price})
+        if paper_trading:
+            balance -= price
+        else:
+            bitvavo.placeOrder("ETH-EUR", {'side': 'buy', 'orderType': 'market', 'amount': str(1)})
 
-# Resultaten
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("💰 Beginsaldo", f"€{INITIAL_BALANCE:.2f}")
-    st.metric("📈 Eindsaldo (paper)", f"€{end_balance:.2f}")
-    st.metric("📊 ETH Prijs", f"€{current_price:.2f}")
-with col2:
-    st.line_chart(df[["close"]].rename(columns={"close": "ETH-EUR"}))
+    elif decision == 0 and open_positions:
+        position = open_positions.pop(0)
+        profit = price - position["entry"]
+        if paper_trading:
+            balance += price
+        else:
+            bitvavo.placeOrder("ETH-EUR", {'side': 'sell', 'orderType': 'market', 'amount': str(1)})
+        st.success(f"SELL @ {price:.2f} EUR | Profit: {profit:.2f} EUR")
 
-# Handmatige schakelaar
-real_trade = st.toggle("🔁 Zet over naar echt traden", value=False)
+def toggle_trading():
+    global paper_trading
+    paper_trading = not paper_trading
 
-if real_trade:
-    st.warning("Echte trading is nu actief! (nog niet geïmplementeerd, alleen simulatie)")
-    # hier komt later code voor echte trading
-else:
-    st.info("De AI leert nu via paper trading. Zet over naar echt traden zodra het model goed presteert.")
+# Streamlit UI
+st.title("AI Crypto Trading Bot")
+
+if st.button("Toggle: Paper Trading / Live Trading"):
+    toggle_trading()
+
+st.write(f"**Mode**: {'🧪 Pap
