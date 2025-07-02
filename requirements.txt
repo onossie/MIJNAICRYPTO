@@ -1,5 +1,5 @@
 streamlit
-python_bitvavo_api
 pandas
 numpy
 scikit-learn
+python-bitvavo-api
