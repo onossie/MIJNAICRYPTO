@@ -120,4 +120,4 @@ st.subheader("📊 Resultaten")
 if results:
     result_df = pd.DataFrame(results)
     result_df['profit(€)'] = result_df['profit']
-    st.dataframe(result_df[["coin", "buy", "sell", "profit(€]()]()_
+    st.dataframe(result_df[["coin", "buy", "sell", "profit(€)"]].sort_values(by="profit(€)", ascending=False))
