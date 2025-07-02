@@ -1,5 +1,5 @@
 streamlit
-bitvavo
 pandas
 numpy
 ta
+git+https://github.com/Bitvavo/python-bitvavo-api.git@master
