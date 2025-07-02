@@ -25,7 +25,6 @@ START_BALANCE = 96.0
 paper_trading = True
 
 MIN_CANDLES = 50
-MAX_COINS = 100  # Limit voor performance
 
 MODEL_DIR = "models"
 if not os.path.exists(MODEL_DIR):
@@ -35,7 +34,7 @@ if not os.path.exists(MODEL_DIR):
 def get_all_eur_markets():
     markets = bitvavo.markets()
     coins = [m['market'] for m in markets if m['quote'] == 'EUR']
-    return coins[:MAX_COINS]
+    return coins  # Geen limiet, alle EUR coins
 
 def get_historical_prices(symbol, interval='1h', limit=100):
     try:
@@ -152,11 +151,10 @@ for i, coin in enumerate(coin_list):
     current_price = latest['close'].values[0]
 
     if decision == 1 and st.session_state.balance >= current_price and best_accuracy < 1.0:
-        # Koop mogelijkheid, kies hoogste accuracy (we zetten acc max op 1.0)
         best_coin = coin
         best_signal = "buy"
         best_price = current_price
-        best_accuracy = 1.0  # Max waarde prioriteit
+        best_accuracy = 1.0
 
     elif decision == 0:
         held_positions = [pos for pos in st.session_state.open_positions if pos['coin'] == coin]
@@ -166,7 +164,7 @@ for i, coin in enumerate(coin_list):
             best_price = current_price
             best_accuracy = 1.0
 
-    progress_bar.progress((i+1)/len(coin_list))
+    progress_bar.progress((i + 1) / len(coin_list))
     time.sleep(0.05)
 
 progress_text.text("Klaar met analyseren.")
