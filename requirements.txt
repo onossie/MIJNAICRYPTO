@@ -1,0 +1,5 @@
+streamlit
+bitvavo
+pandas
+numpy
+ta
