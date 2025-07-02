@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from bitvavo import Bitvavo
+from python_bitvavo_api.bitvavo import Bitvavo
 import ta
 from datetime import datetime
 
