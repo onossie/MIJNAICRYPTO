@@ -2,5 +2,5 @@ streamlit
 pandas
 numpy
 scikit-learn
-python-bitvavo-api
 joblib
+python-bitvavo-api
