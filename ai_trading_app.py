@@ -1,22 +1,20 @@
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import os
-import time
-import joblib
+import threading
+import json
+from websocket import WebSocketApp
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from python_bitvavo_api.bitvavo import Bitvavo
+import joblib
 import concurrent.futures
 import matplotlib.pyplot as plt
+from python_bitvavo_api.bitvavo import Bitvavo
 
-# ====== AUTO REFRESH =======
-st_autorefresh(interval=60000, limit=None, key="auto-refresh")
-
-# ====== CONFIG =======
+# ====== CONFIG & CONSTANTS ======
 API_KEY = st.secrets["BITVAVO_API_KEY"]
 API_SECRET = st.secrets["BITVAVO_API_SECRET"]
 
@@ -37,7 +35,8 @@ STOP_LOSS_PCT = 0.015
 TRAILING_STOP_TRIGGER_PCT = 0.015
 TRAILING_STOP_GAP_PCT = 0.005
 
-# ====== Helper functies =======
+# ====== Helper functies ======
+
 def get_all_eur_markets():
     markets = bitvavo.markets()
     return [m['market'] for m in markets if m['quote'] == 'EUR']
@@ -130,8 +129,48 @@ def analyze_coin(coin):
         'df': df
     }
 
-# ====== Streamlit UI =======
-st.title("🤖 AI Crypto Trading Bot - Snelle parallelle analyse")
+# ====== WebSocket voor realtime prijzen ======
+
+if 'live_prices' not in st.session_state:
+    st.session_state.live_prices = {}
+
+def on_message(ws, message):
+    data = json.loads(message)
+    if data.get('event') == 'ticker':
+        market = data['market']
+        price = float(data['last'])
+        st.session_state.live_prices[market] = price
+
+def on_error(ws, error):
+    print("WebSocket error:", error)
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed")
+
+def on_open(ws):
+    subscribe_msg = {
+        "action": "subscribe",
+        "channels": [{"name": "ticker", "markets": get_all_eur_markets()}]
+    }
+    ws.send(json.dumps(subscribe_msg))
+
+def start_ws():
+    ws = WebSocketApp(
+        "wss://ws.bitvavo.com/v2/",
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open
+    )
+    ws.run_forever()
+
+if 'ws_thread_started' not in st.session_state:
+    threading.Thread(target=start_ws, daemon=True).start()
+    st.session_state.ws_thread_started = True
+
+# ====== Streamlit UI ======
+
+st.title("🤖 AI Crypto Trading Bot - Realtime met WebSocket prijzen")
 st.markdown("Paper trading modus actief — startbudget is €96.")
 
 if 'balance' not in st.session_state:
@@ -149,7 +188,8 @@ if st.sidebar.button("🔄 Reset paper trading"):
     st.session_state.open_positions = []
     st.session_state.trade_history = []
 
-# ====== Haal coin lijst op =======
+# ====== Haal coins en analyse ======
+
 coin_list = get_all_eur_markets()
 st.subheader(f"Analyseer {len(coin_list)} EUR coins in parallel...")
 
@@ -168,7 +208,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
 
 progress_text.text("Analyse voltooid.")
 
-# ====== Zoek beste trade kans =======
+# ====== Trade beslissingen ======
+
 best_coin = None
 best_signal = None
 best_price = None
@@ -192,13 +233,12 @@ if best_coin is None:
             best_price = found['price']
             break
 
-# ====== Trade Logica =======
 st.subheader("📊 Trade Beslissing")
 
 if best_coin is None:
     st.info("Geen goede trade kansen gevonden op dit moment.")
 else:
-    st.write(f"Beslissing: **{best_signal.upper()}** {best_coin} @ €{best_price:.2f}")
+    st.write(f"Beslissing: **{best_signal.upper()}** {best_coin} @ €{best_price:.4f}")
 
     if best_signal == "buy" and st.session_state.balance >= best_price:
         st.session_state.open_positions.append({
@@ -207,7 +247,7 @@ else:
             'highest_price': best_price
         })
         st.session_state.balance -= best_price
-        st.success(f"✅ Gekocht {best_coin} voor €{best_price:.2f}")
+        st.success(f"✅ Gekocht {best_coin} voor €{best_price:.4f}")
 
     elif best_signal == "check_exit":
         for position in st.session_state.open_positions:
@@ -239,41 +279,51 @@ else:
                     'profit': profit,
                     'reason': reason
                 })
-                st.warning(f"Verkocht {best_coin} voor €{best_price:.2f} ({reason})")
+                st.warning(f"Verkocht {best_coin} voor €{best_price:.4f} ({reason})")
                 break
 
 st.markdown("---")
-st.subheader("💰 Balans en open posities")
-st.write(f"**Saldo:** €{st.session_state.balance:.2f}")
+st.subheader("💼 Open posities — realtime prijzen")
+
 if st.session_state.open_positions:
     df_pos = pd.DataFrame(st.session_state.open_positions)
-    df_pos['current_price'] = df_pos['coin'].apply(lambda c: next((r['price'] for r in results if r['coin'] == c), np.nan))
+    df_pos['current_price'] = df_pos['coin'].apply(lambda c: st.session_state.live_prices.get(c, np.nan))
     df_pos['unrealized_profit'] = df_pos['current_price'] - df_pos['entry_price']
-    df_pos['unrealized_profit_pct'] = df_pos['unrealized_profit'] / df_pos['entry_price'] * 100
-    st.dataframe(df_pos[['coin', 'entry_price', 'current_price', 'unrealized_profit', 'unrealized_profit_pct']])
+    df_pos['unrealized_profit_pct'] = (df_pos['unrealized_profit'] / df_pos['entry_price']) * 100
+
+    def highlight(val):
+        color = 'green' if val > 0 else 'red' if val < 0 else 'black'
+        return f'color: {color}'
+
+    st.dataframe(
+        df_pos[['coin', 'entry_price', 'current_price', 'unrealized_profit', 'unrealized_profit_pct']].style
+        .format({
+            'entry_price': '€{:.4f}',
+            'current_price': '€{:.4f}',
+            'unrealized_profit': '€{:.4f}',
+            'unrealized_profit_pct': '{:.2f}%'
+        })
+        .applymap(highlight, subset=['unrealized_profit', 'unrealized_profit_pct'])
+    )
+    st.bar_chart(df_pos.set_index("coin")["unrealized_profit"])
 else:
-    st.write("Geen open posities.")
+    st.info("📭 Geen open posities.")
 
 st.markdown("---")
-st.subheader("📈 Historische performance")
+st.subheader("💰 Beschikbaar saldo")
+st.metric("€ EUR saldo", f"€{st.session_state.balance:.2f}")
 
+st.markdown("---")
+st.subheader("📜 Trade geschiedenis")
 if st.session_state.trade_history:
     df_hist = pd.DataFrame(st.session_state.trade_history)
-    df_hist['cumulative_profit'] = df_hist['profit'].cumsum()
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(df_hist.index, df_hist['cumulative_profit'], marker='o')
-    ax.set_title("Cumulatieve winst over trades")
-    ax.set_xlabel("Trade nummer")
-    ax.set_ylabel("Winst (€)")
-    ax.grid(True)
-    st.pyplot(fig)
+    st.dataframe(df_hist.style.format({
+        'entry': '€{:.4f}',
+        'exit': '€{:.4f}',
+        'profit': '€{:.4f}'
+    }))
 else:
-    st.write("Nog geen trades gemaakt.")
+    st.info("Geen trades gemaakt.")
 
-# Extra: toon accuracies van modellen (indien beschikbaar)
-accuracies = [r['accuracy'] for r in results if r['accuracy'] is not None]
-if accuracies:
-    avg_acc = np.mean(accuracies)
-    st.write(f"Gemiddelde model accuracy (laatste training): {avg_acc:.2f}")
-else:
-    st.write("Geen accuracy data beschikbaar.")
+# Trigger refresh elke 10 seconden om WebSocket data te tonen
+st.experimental_rerun()
