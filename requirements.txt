@@ -1,8 +1,8 @@
 streamlit
 streamlit-autorefresh
 python-bitvavo-api
+scikit-learn
 pandas
 numpy
-scikit-learn
-matplotlib
 joblib
+matplotlib
