@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from python_bitvavo_api.bitvavo import Bitvavo
 
-# ====== AUTO REFRESH INSTELLING ======
+# ====== AUTO REFRESH ======
 st_autorefresh(interval=60000, limit=None, key="auto-refresh")
 
 # ====== CONFIG =======
@@ -31,6 +31,7 @@ MIN_CANDLES = 50
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# Trade instellingen
 TAKE_PROFIT_PCT = 0.02
 STOP_LOSS_PCT = 0.015
 TRAILING_STOP_TRIGGER_PCT = 0.015
@@ -106,11 +107,7 @@ def predict_action(model, scaler, latest_row):
     pred = model.predict(X_scaled)[-1]
     return pred  # 1 = buy, 0 = sell
 
-# ====== Streamlit UI =======
-st.title("🤖 AI Crypto Trading Bot — Autorefresh elke 60 seconden")
-st.markdown("Paper trading modus actief — het startbudget is €96.")
-
-# Init session state
+# ====== INITIALISEER SESSION STATE =======
 if 'balance' not in st.session_state:
     st.session_state.balance = START_BALANCE
 
@@ -120,193 +117,171 @@ if 'open_positions' not in st.session_state:
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 
-if 'balance_history' not in st.session_state:
-    st.session_state.balance_history = [START_BALANCE]
+if 'equity_curve' not in st.session_state:
+    st.session_state.equity_curve = [(pd.Timestamp.now(), START_BALANCE)]
 
-if 'accuracy_per_coin' not in st.session_state:
-    st.session_state.accuracy_per_coin = {}
+# ====== UI =======
+st.title("🤖 AI Crypto Trading Bot — Automatische Visualisatie")
+st.markdown("Paper trading modus actief — startbudget is €96.")
 
-# Sidebar controls
 st.sidebar.header("⚙️ Handmatige controls")
 if st.sidebar.button("🔄 Reset paper trading"):
     st.session_state.balance = START_BALANCE
     st.session_state.open_positions = []
     st.session_state.trade_history = []
-    st.session_state.balance_history = [START_BALANCE]
-    st.session_state.accuracy_per_coin = {}
+    st.session_state.equity_curve = [(pd.Timestamp.now(), START_BALANCE)]
 
-# ====== AI Analyse en Trade Logic =======
+# ====== AI Analyse en Trading =======
 coin_list = get_all_eur_markets()
-st.subheader("📈 AI Trading Actie")
+st.subheader("📈 AI Trading Acties")
 
-valid_coins = []
-coin_data = {}
+best_coin = None
+best_signal = None
+best_price = None
 
-# Stap 1: Bepaal geldige coins (voldoende candles + model mogelijk)
-for coin in coin_list:
+progress_text = st.empty()
+progress_bar = st.progress(0)
+
+for i, coin in enumerate(coin_list):
+    progress_text.text(f"Analyseer {coin} ({i+1}/{len(coin_list)})")
     df = get_historical_prices(coin)
     if df is None:
         continue
-    model, scaler = load_model_and_scaler(coin)
+
+    model, scaler = train_or_load_model(df, coin)
     if model is None or scaler is None:
-        model, scaler, accuracy = train_model(df)
-        if model is None:
-            continue
-        save_model_and_scaler(coin, model, scaler)
-        st.session_state.accuracy_per_coin[coin] = accuracy
-    else:
-        accuracy = st.session_state.accuracy_per_coin.get(coin, None)
+        continue
 
-    valid_coins.append(coin)
-    coin_data[coin] = {
-        'df': df,
-        'model': model,
-        'scaler': scaler,
-        'accuracy': accuracy
-    }
+    latest = df.tail(1)
+    decision = predict_action(model, scaler, latest)
+    current_price = latest['close'].values[0]
 
-if not valid_coins:
-    st.warning("Geen geldige coins gevonden om mee te handelen.")
+    if decision == 1 and st.session_state.balance >= current_price:
+        best_coin = coin
+        best_signal = "buy"
+        best_price = current_price
+        break
+    elif decision == 0:
+        for position in st.session_state.open_positions:
+            if position['coin'] == coin:
+                best_coin = coin
+                best_signal = "check_exit"
+                best_price = current_price
+                break
+
+    progress_bar.progress((i + 1) / len(coin_list))
+    time.sleep(0.01)
+
+progress_text.text("Klaar met analyseren.")
+
+# ====== Trade Uitvoering =======
+st.subheader("📊 Trade Beslissing")
+
+if best_coin is None:
+    st.info("Geen goede trade kansen gevonden op dit moment.")
 else:
-    per_trade_budget = st.session_state.balance / len(valid_coins) if len(valid_coins) > 0 else 0
-    progress_bar = st.progress(0)
-    trades_today = 0
+    st.write(f"Beslissing: **{best_signal.upper()}** {best_coin} @ €{best_price:.2f}")
 
-    for i, coin in enumerate(valid_coins):
-        progress_bar.progress((i + 1) / len(valid_coins))
-        df = coin_data[coin]['df']
-        model = coin_data[coin]['model']
-        scaler = coin_data[coin]['scaler']
-        latest = df.tail(1)
-        decision = predict_action(model, scaler, latest)
-        current_price = latest['close'].values[0]
+    if best_signal == "buy" and st.session_state.balance >= best_price:
+        st.session_state.open_positions.append({
+            'coin': best_coin,
+            'entry_price': best_price,
+            'highest_price': best_price,
+            'entry_time': pd.Timestamp.now()
+        })
+        st.session_state.balance -= best_price
+        st.success(f"✅ Gekocht {best_coin} voor €{best_price:.2f}")
 
-        # Check of we al deze coin bezitten
-        already_holding = any(pos['coin'] == coin for pos in st.session_state.open_positions)
+    elif best_signal == "check_exit":
+        for position in st.session_state.open_positions:
+            if position['coin'] == best_coin:
+                entry = position['entry_price']
+                highest = position.get('highest_price', best_price)
+                position['highest_price'] = max(highest, best_price)
+                change_pct = (best_price - entry) / entry
 
-        # Buy logic
-        if decision == 1 and st.session_state.balance >= current_price and not already_holding:
-            st.session_state.open_positions.append({
-                'coin': coin,
-                'entry_price': current_price,
-                'highest_price': current_price
-            })
-            st.session_state.balance -= current_price
-            trades_today += 1
-            st.write(f"✅ Gekocht {coin} voor €{current_price:.2f}")
+                exit_reason = None
+                if change_pct >= TAKE_PROFIT_PCT:
+                    exit_reason = "🎯 Take profit"
+                elif change_pct <= -STOP_LOSS_PCT:
+                    exit_reason = "🛑 Stop loss"
+                elif change_pct >= TRAILING_STOP_TRIGGER_PCT:
+                    if best_price <= position['highest_price'] * (1 - TRAILING_STOP_GAP_PCT):
+                        exit_reason = "🔃 Trailing stop"
 
-        # Sell logic
-        elif decision == 0 and already_holding:
-            for position in st.session_state.open_positions:
-                if position['coin'] == coin:
-                    entry = position['entry_price']
-                    highest = position.get('highest_price', current_price)
-                    position['highest_price'] = max(highest, current_price)
-                    change_pct = (current_price - entry) / entry
-
-                    reason = None
-                    if change_pct >= TAKE_PROFIT_PCT:
-                        reason = "🎯 Take profit"
-                    elif change_pct <= -STOP_LOSS_PCT:
-                        reason = "🛑 Stop loss"
-                    elif change_pct >= TRAILING_STOP_TRIGGER_PCT and current_price <= highest * (1 - TRAILING_STOP_GAP_PCT):
-                        reason = "🔃 Trailing stop"
-
-                    if reason:
-                        profit = current_price - entry
-                        st.session_state.balance += current_price
-                        st.session_state.open_positions.remove(position)
-                        st.session_state.trade_history.append({
-                            'coin': coin,
-                            'entry': entry,
-                            'exit': current_price,
-                            'profit': profit,
-                            'reason': reason
-                        })
-                        st.success(f"{reason} - Verkocht {coin} @ €{current_price:.2f} | Winst: €{profit:.2f}")
+                if exit_reason:
+                    profit = best_price - entry
+                    st.session_state.balance += best_price
+                    st.session_state.open_positions.remove(position)
+                    st.session_state.trade_history.append({
+                        'coin': best_coin,
+                        'entry': entry,
+                        'exit': best_price,
+                        'profit': profit,
+                        'reason': exit_reason,
+                        'entry_time': position['entry_time'],
+                        'exit_time': pd.Timestamp.now()
+                    })
+                    st.success(f"{exit_reason} - Verkocht {best_coin} @ €{best_price:.2f} | Winst: €{profit:.2f}")
                     break
-        time.sleep(0.05)
 
-    progress_bar.empty()
-    st.info(f"Analyse compleet. {trades_today} nieuwe kooporders geplaatst.")
+# ====== Update equity curve =======
+latest_equity = st.session_state.equity_curve[-1][1]
+# Equity = balans + open posities waarde
+open_positions_value = 0
+for pos in st.session_state.open_positions:
+    # Probeer huidige prijs op te halen
+    df_pos = get_historical_prices(pos['coin'], limit=1)
+    if df_pos is not None:
+        current_close = df_pos['close'].values[-1]
+        open_positions_value += current_close
+equity = st.session_state.balance + open_positions_value
+st.session_state.equity_curve.append((pd.Timestamp.now(), equity))
 
-# Update balans geschiedenis
-if len(st.session_state.balance_history) == 0 or st.session_state.balance_history[-1] != st.session_state.balance:
-    st.session_state.balance_history.append(st.session_state.balance)
+# ====== Visualisaties =======
+st.subheader("📈 Equity Curve (Balans + Open Posities)")
 
-# ====== Resultaten tonen =======
-st.subheader("💰 Huidige balans")
-st.write(f"€{st.session_state.balance:.2f}")
+# Equity curve plot
+times, balances = zip(*st.session_state.equity_curve)
+fig, ax = plt.subplots()
+ax.plot(times, balances, marker='o')
+ax.set_xlabel("Tijd")
+ax.set_ylabel("Equity (€)")
+ax.set_title("Equity Curve")
+ax.grid(True)
+fig.autofmt_xdate()
+st.pyplot(fig)
 
-st.subheader("📌 Open posities")
+st.subheader("💰 Huidige balans en open posities")
+st.write(f"€{st.session_state.balance:.2f} beschikbaar")
+
 if st.session_state.open_positions:
-    df_positions = pd.DataFrame(st.session_state.open_positions)
-    # Haal actuele prijzen erbij voor grafiek
-    current_prices = []
-    for pos in st.session_state.open_positions:
-        df = get_historical_prices(pos['coin'])
-        if df is not None:
-            current_prices.append(df['close'].iloc[-1])
-        else:
-            current_prices.append(np.nan)
-    df_positions['current_price'] = current_prices
-    st.dataframe(df_positions)
+    st.dataframe(pd.DataFrame(st.session_state.open_positions))
 else:
     st.info("Geen open posities.")
 
-st.subheader("📈 Trade geschiedenis")
+st.subheader("📊 Trade geschiedenis")
 if st.session_state.trade_history:
     df_history = pd.DataFrame(st.session_state.trade_history)
     st.dataframe(df_history)
     totaal_winst = df_history['profit'].sum()
     st.metric("Totale winst (paper trading)", f"€{totaal_winst:.2f}")
+
+    # Plot trades op prijsgrafiek van laatste coin in trade_history
+    laatste_trade = df_history.iloc[-1]
+    coin = laatste_trade['coin']
+    df_coin = get_historical_prices(coin, limit=100)
+    if df_coin is not None:
+        fig2, ax2 = plt.subplots()
+        ax2.plot(df_coin['timestamp'], df_coin['close'], label='Prijs (€)')
+        ax2.axhline(y=laatste_trade['entry'], color='green', linestyle='--', label='Entry prijs')
+        ax2.axhline(y=laatste_trade['exit'], color='red', linestyle='--', label='Exit prijs')
+        ax2.set_title(f"Trade prijs grafiek {coin}")
+        ax2.set_xlabel("Tijd")
+        ax2.set_ylabel("Prijs (€)")
+        ax2.legend()
+        fig2.autofmt_xdate()
+        st.pyplot(fig2)
 else:
-    st.info("Nog geen trades afgesloten.")
+    st.info("Nog geen afgesloten trades.")
 
-# ====== Visualisaties =======
-st.subheader("📊 Visualisaties")
-
-# 1. Balans over tijd
-fig1, ax1 = plt.subplots()
-ax1.plot(st.session_state.balance_history, marker='o')
-ax1.set_title("Balans over tijd")
-ax1.set_xlabel("Update #")
-ax1.set_ylabel("€")
-st.pyplot(fig1)
-
-# 2. Winst per coin (uit trade history)
-if st.session_state.trade_history:
-    df_hist = pd.DataFrame(st.session_state.trade_history)
-    winst_per_coin = df_hist.groupby('coin')['profit'].sum().sort_values(ascending=False)
-    fig2, ax2 = plt.subplots()
-    winst_per_coin.plot(kind='bar', ax=ax2, color='green')
-    ax2.set_title("Totale winst per coin")
-    ax2.set_ylabel("€ winst")
-    st.pyplot(fig2)
-else:
-    st.write("Nog geen winst per coin beschikbaar.")
-
-# 3. Accuracy per coin
-if st.session_state.accuracy_per_coin:
-    acc_df = pd.DataFrame.from_dict(st.session_state.accuracy_per_coin, orient='index', columns=['accuracy'])
-    acc_df_sorted = acc_df.sort_values('accuracy', ascending=False)
-    fig3, ax3 = plt.subplots()
-    acc_df_sorted['accuracy'].plot(kind='bar', ax=ax3, color='blue')
-    ax3.set_title("Model accuracy per coin")
-    ax3.set_ylabel("Accuracy")
-    ax3.set_ylim(0,1)
-    st.pyplot(fig3)
-else:
-    st.write("Nog geen model accuracy beschikbaar.")
-
-# 4. Open posities prijsvergelijking
-if st.session_state.open_positions:
-    fig4, ax4 = plt.subplots()
-    ax4.bar(df_positions['coin'], df_positions['current_price'], label='Huidige prijs')
-    ax4.bar(df_positions['coin'], df_positions['entry_price'], label='Instapprijs', alpha=0.7)
-    ax4.set_title("Open posities: Instapprijs vs huidige prijs")
-    ax4.set_ylabel("€")
-    ax4.legend()
-    st.pyplot(fig4)
-else:
-    st.write("Geen open posities om te visualiseren.")
