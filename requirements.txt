@@ -4,3 +4,4 @@ numpy
 scikit-learn
 joblib
 python-bitvavo-api
+streamlit-autorefresh
