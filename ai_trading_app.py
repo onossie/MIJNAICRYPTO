@@ -1,20 +1,22 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import os
-import threading
-import json
-from websocket import WebSocketApp
+import time
+import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-import joblib
-import concurrent.futures
-import matplotlib.pyplot as plt
 from python_bitvavo_api.bitvavo import Bitvavo
+import concurrent.futures
+import threading
+import websocket
+import json
+import matplotlib.pyplot as plt
 
-# ====== CONFIG & CONSTANTS ======
+# ====== CONFIG =======
 API_KEY = st.secrets["BITVAVO_API_KEY"]
 API_SECRET = st.secrets["BITVAVO_API_SECRET"]
 
@@ -35,8 +37,10 @@ STOP_LOSS_PCT = 0.015
 TRAILING_STOP_TRIGGER_PCT = 0.015
 TRAILING_STOP_GAP_PCT = 0.005
 
-# ====== Helper functies ======
+# ====== Auto refresh elke 10 seconden =======
+st_autorefresh(interval=10_000, key="auto_refresh")
 
+# ====== Helper functies =======
 def get_all_eur_markets():
     markets = bitvavo.markets()
     return [m['market'] for m in markets if m['quote'] == 'EUR']
@@ -129,47 +133,51 @@ def analyze_coin(coin):
         'df': df
     }
 
-# ====== WebSocket voor realtime prijzen ======
-
-if 'live_prices' not in st.session_state:
-    st.session_state.live_prices = {}
-
+# ====== WebSocket live prices =======
 def on_message(ws, message):
     data = json.loads(message)
-    if data.get('event') == 'ticker':
-        market = data['market']
-        price = float(data['last'])
-        st.session_state.live_prices[market] = price
+    if "market" in data and "close" in data:
+        coin = data["market"]
+        price = float(data["close"])
+        if 'live_prices' not in st.session_state:
+            st.session_state.live_prices = {}
+        st.session_state.live_prices[coin] = price
 
 def on_error(ws, error):
-    print("WebSocket error:", error)
+    print(f"WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed")
 
 def on_open(ws):
+    # Subscribe to ticker for all EUR markets
+    markets = get_all_eur_markets()
+    params = [{"market": m, "interval": "1m"} for m in markets]
     subscribe_msg = {
         "action": "subscribe",
-        "channels": [{"name": "ticker", "markets": get_all_eur_markets()}]
+        "subscriptions": [
+            {"name": "ticker", "markets": markets}
+        ]
     }
     ws.send(json.dumps(subscribe_msg))
 
-def start_ws():
-    ws = WebSocketApp(
-        "wss://ws.bitvavo.com/v2/",
+def start_ws_client():
+    ws_url = "wss://ws.bitvavo.com/v2/"
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
-        on_open=on_open
     )
     ws.run_forever()
 
+# Start WebSocket thread once
 if 'ws_thread_started' not in st.session_state:
-    threading.Thread(target=start_ws, daemon=True).start()
+    threading.Thread(target=start_ws_client, daemon=True).start()
     st.session_state.ws_thread_started = True
 
-# ====== Streamlit UI ======
-
+# ====== Streamlit UI =======
 st.title("🤖 AI Crypto Trading Bot - Realtime met WebSocket prijzen")
 st.markdown("Paper trading modus actief — startbudget is €96.")
 
@@ -182,14 +190,17 @@ if 'open_positions' not in st.session_state:
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 
+if 'live_prices' not in st.session_state:
+    st.session_state.live_prices = {}
+
 st.sidebar.header("⚙️ Handmatige controls")
 if st.sidebar.button("🔄 Reset paper trading"):
     st.session_state.balance = START_BALANCE
     st.session_state.open_positions = []
     st.session_state.trade_history = []
+    st.session_state.live_prices = {}
 
-# ====== Haal coins en analyse ======
-
+# ====== Analyseer coins parallel =======
 coin_list = get_all_eur_markets()
 st.subheader(f"Analyseer {len(coin_list)} EUR coins in parallel...")
 
@@ -205,16 +216,14 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             results.append(result)
         progress_text.text(f"Analyseer coins: {i+1}/{len(coin_list)}")
         progress_bar.progress((i+1)/len(coin_list))
-
 progress_text.text("Analyse voltooid.")
 
-# ====== Trade beslissingen ======
-
+# ====== Zoek beste trade kans =======
 best_coin = None
 best_signal = None
 best_price = None
 
-# Zoek koopkansen (buy) als je voldoende balance hebt
+# Koop signaal als er genoeg saldo is
 for res in results:
     if res['decision'] == 1 and st.session_state.balance >= res['price']:
         best_coin = res['coin']
@@ -222,7 +231,7 @@ for res in results:
         best_price = res['price']
         break
 
-# Zoek verkoopsignalen (check exit) voor open posities
+# Check verkoopsignalen voor open posities
 if best_coin is None:
     for pos in st.session_state.open_positions:
         coin = pos['coin']
@@ -233,6 +242,7 @@ if best_coin is None:
             best_price = found['price']
             break
 
+# ====== Trade logica =======
 st.subheader("📊 Trade Beslissing")
 
 if best_coin is None:
@@ -257,6 +267,7 @@ else:
                 position['highest_price'] = max(highest, best_price)
                 change_pct = (best_price - entry) / entry
 
+                reason = None
                 if change_pct >= TAKE_PROFIT_PCT:
                     reason = "🎯 Take profit"
                 elif change_pct <= -STOP_LOSS_PCT:
@@ -264,22 +275,19 @@ else:
                 elif change_pct >= TRAILING_STOP_TRIGGER_PCT:
                     if best_price <= position['highest_price'] * (1 - TRAILING_STOP_GAP_PCT):
                         reason = "🔃 Trailing stop"
-                    else:
-                        continue
-                else:
-                    continue
 
-                profit = best_price - entry
-                st.session_state.balance += best_price
-                st.session_state.open_positions.remove(position)
-                st.session_state.trade_history.append({
-                    'coin': best_coin,
-                    'entry': entry,
-                    'exit': best_price,
-                    'profit': profit,
-                    'reason': reason
-                })
-                st.warning(f"Verkocht {best_coin} voor €{best_price:.4f} ({reason})")
+                if reason:
+                    profit = best_price - entry
+                    st.session_state.balance += best_price
+                    st.session_state.open_positions.remove(position)
+                    st.session_state.trade_history.append({
+                        'coin': best_coin,
+                        'entry': entry,
+                        'exit': best_price,
+                        'profit': profit,
+                        'reason': reason
+                    })
+                    st.warning(f"Verkocht {best_coin} voor €{best_price:.4f} ({reason})")
                 break
 
 st.markdown("---")
@@ -325,5 +333,10 @@ if st.session_state.trade_history:
 else:
     st.info("Geen trades gemaakt.")
 
-# Trigger refresh elke 10 seconden om WebSocket data te tonen
-st.experimental_rerun()
+# Extra: toon accuracies van modellen (indien beschikbaar)
+accuracies = [r['accuracy'] for r in results if r['accuracy'] is not None]
+if accuracies:
+    avg_acc = np.mean(accuracies)
+    st.write(f"Gemiddelde model accuracy (laatste training): {avg_acc:.2f}")
+else:
+    st.write("Geen accuracy data beschikbaar.")
