@@ -1,8 +1,8 @@
 streamlit
-streamlit-autorefresh
-python-bitvavo-api
-scikit-learn
 pandas
 numpy
-joblib
+scikit-learn
 matplotlib
+python-bitvavo-api
+websocket-client
+joblib
