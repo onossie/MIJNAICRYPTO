@@ -5,6 +5,7 @@ import numpy as np
 import os
 import time
 import joblib
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -12,7 +13,6 @@ from sklearn.metrics import accuracy_score
 from python_bitvavo_api.bitvavo import Bitvavo
 
 # ====== AUTO REFRESH INSTELLING ======
-# Ververs elke 60 seconden (60000 ms)
 st_autorefresh(interval=60000, limit=None, key="auto-refresh")
 
 # ====== CONFIG =======
@@ -33,6 +33,7 @@ MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ====== Helper functies =======
+@st.cache_data(ttl=3600)
 def get_all_eur_markets():
     markets = bitvavo.markets()
     return [m['market'] for m in markets if m['quote'] == 'EUR']
@@ -51,9 +52,9 @@ def get_historical_prices(symbol, interval='1h', limit=100):
 
 def train_model(df):
     df = df.copy()
-    df['future_close'] = df['close'].shift(-1)
+    df['future_close'] = df['close'].shift(-3)
     df.dropna(inplace=True)
-    df['target'] = (df['future_close'] > df['close']).astype(int)
+    df['target'] = (df['future_close'] > df['close'] * 1.003).astype(int)
 
     X = df[["open", "high", "low", "close", "volume"]]
     y = df['target']
@@ -100,10 +101,10 @@ def predict_action(model, scaler, latest_row):
     X = latest_row[["open", "high", "low", "close", "volume"]]
     X_scaled = scaler.transform(X)
     pred = model.predict(X_scaled)[-1]
-    return pred  # 1 = buy, 0 = sell
+    return pred
 
 # ====== Streamlit UI =======
-st.title("🤖 AI Crypto Trading Bot — Autorefresh elke 60 seconden")
+st.title("🤖 AI Crypto Trading Bot — Verbeterde Versie")
 st.markdown("Paper trading modus actief — het startbudget is €96.")
 
 if 'balance' not in st.session_state:
@@ -123,8 +124,7 @@ if st.sidebar.button("🔄 Reset paper trading"):
 
 # ====== AI Analyse en Trade Logic =======
 coin_list = get_all_eur_markets()
-st.subheader("📈 AI Trading Actie")
-
+accuracies = []
 best_coin = None
 best_signal = None
 best_price = None
@@ -132,37 +132,48 @@ best_price = None
 progress_text = st.empty()
 progress_bar = st.progress(0)
 
-for i, coin in enumerate(coin_list):
-    progress_text.text(f"Analyseer {coin} ({i+1}/{len(coin_list)})")
+results = []
+
+def analyse_coin(coin):
     df = get_historical_prices(coin)
     if df is None:
-        continue
-
-    model, scaler = train_or_load_model(df, coin)
+        return None
+    model, scaler, acc = train_model(df)
     if model is None or scaler is None:
-        continue
-
+        return None
     latest = df.tail(1)
     decision = predict_action(model, scaler, latest)
-    current_price = latest['close'].values[0]
+    price = latest['close'].values[0]
+    return {
+        'coin': coin,
+        'accuracy': acc,
+        'decision': decision,
+        'price': price,
+        'model': model,
+        'scaler': scaler
+    }
 
-    if decision == 1 and st.session_state.balance >= current_price:
-        best_coin = coin
-        best_signal = "buy"
-        best_price = current_price
+with ThreadPoolExecutor(max_workers=10) as executor:
+    futures = {executor.submit(analyse_coin, coin): coin for coin in coin_list}
+    for i, future in enumerate(futures):
+        result = future.result()
+        if result:
+            results.append(result)
+        progress_bar.progress((i + 1) / len(coin_list))
+        progress_text.text(f"Analyseren coin {i+1}/{len(coin_list)}")
+
+progress_text.text("Analyse voltooid")
+
+# Bepaal beste trade
+for r in results:
+    accuracies.append({'coin': r['coin'], 'accuracy': r['accuracy']})
+    if r['decision'] == 1 and st.session_state.balance >= r['price']:
+        best_coin, best_signal, best_price = r['coin'], 'buy', r['price']
         break
-    elif decision == 0:
-        held_positions = [pos for pos in st.session_state.open_positions if pos['coin'] == coin]
-        if held_positions:
-            best_coin = coin
-            best_signal = "sell"
-            best_price = current_price
+    elif r['decision'] == 0:
+        if any(p['coin'] == r['coin'] for p in st.session_state.open_positions):
+            best_coin, best_signal, best_price = r['coin'], 'sell', r['price']
             break
-
-    progress_bar.progress((i + 1) / len(coin_list))
-    time.sleep(0.05)
-
-progress_text.text("Klaar met analyseren.")
 
 # ====== Uitvoeren van trade =======
 st.subheader("📊 Trade Beslissing")
@@ -171,28 +182,24 @@ if best_coin is None:
     st.info("Geen goede trade kansen gevonden op dit moment.")
 else:
     st.write(f"Beste trade kans: **{best_signal.upper()}** {best_coin} @ €{best_price:.2f}")
-
-    if best_signal == "buy" and st.session_state.balance >= best_price:
+    if best_signal == "buy":
         st.session_state.open_positions.append({'coin': best_coin, 'entry_price': best_price})
         st.session_state.balance -= best_price
         st.success(f"✅ Gekocht {best_coin} voor €{best_price:.2f}")
-
     elif best_signal == "sell":
-        held_positions = [pos for pos in st.session_state.open_positions if pos['coin'] == best_coin]
-        if held_positions:
-            position = held_positions[0]
-            profit = best_price - position['entry_price']
+        pos = next((p for p in st.session_state.open_positions if p['coin'] == best_coin), None)
+        if pos:
+            profit = best_price - pos['entry_price']
             st.session_state.balance += best_price
-            st.session_state.open_positions.remove(position)
+            st.session_state.open_positions.remove(pos)
             st.session_state.trade_history.append({
                 'coin': best_coin,
-                'entry': position['entry_price'],
+                'entry': pos['entry_price'],
                 'exit': best_price,
                 'profit': profit,
+                'date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
             })
             st.success(f"🛒 Verkocht {best_coin} voor €{best_price:.2f} | Winst: €{profit:.2f}")
-        else:
-            st.warning("Je hebt deze coin niet om te verkopen.")
 
 # ====== Resultaten tonen =======
 st.subheader("💰 Huidige balans")
@@ -212,3 +219,11 @@ if st.session_state.trade_history:
     st.metric("Totale winst (paper trading)", f"€{totaal_winst:.2f}")
 else:
     st.info("Nog geen trades afgesloten.")
+
+st.subheader("📊 Model Accuracies")
+df_acc = pd.DataFrame(accuracies)
+if not df_acc.empty:
+    df_acc = df_acc.sort_values(by="accuracy", ascending=False)
+    st.bar_chart(df_acc.set_index("coin"))
+else:
+    st.info("Geen accuracies beschikbaar.")
